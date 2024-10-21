@@ -6,6 +6,7 @@ import utils.config as config
 
 import cv2
 import einops
+import imghdr
 import pdb
 import numpy as np
 import os
@@ -14,7 +15,7 @@ import torch
 from pytorch_lightning import seed_everything
 import torchvision.transforms as transforms
 
-from PIL import Image
+from PIL import Image, ImageFilter
 from annotator.util import resize_image, HWC3
 from annotator.canny import CannyDetector
 from annotator.mlsd import MLSDdetector
@@ -30,38 +31,104 @@ from huggingface_hub import hf_hub_download
 from models.util import create_model, load_state_dict
 from models.ddim_hacked import DDIMSampler
 
-def apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0):
-    print(f"Loading LoRA weights from {lora_checkpoint_path}")
+CUDA_VISIBLE_DEVICES=1
+def print_model_modules(model):
+    print("Uni-controlnet의 모듈:")
+    for name, module in model.named_modules():
+        print(f"- {name}")
+        if isinstance(module, torch.nn.Sequential) and len(list(module.children())) > 0:
+            last_layer = list(module.children())[-1]
+            if hasattr(last_layer, 'in_channels') and hasattr(last_layer, 'out_channels'):
+                print(f"  마지막 레이어 ({name}) 입력 채널: {last_layer.in_channels}")
+                print(f"  마지막 레이어 ({name}) 출력 채널: {last_layer.out_channels}")
+        
+        # 다운샘플링 레이어 확인
+        if isinstance(module, (torch.nn.MaxPool2d, torch.nn.AvgPool2d)) or \
+           (isinstance(module, torch.nn.Conv2d) and module.stride[0] > 1):
+            print(f"  다운샘플링 레이어: {name} ({type(module).__name__})")
+
+def apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0, custom_mappings=None):
+    print(f"LoRA 가중치를 {lora_checkpoint_path}에서 로딩 중")
     
     with safe_open(lora_checkpoint_path, framework="pt", device="cuda") as f:
         lora_weights = {key: f.get_tensor(key) for key in f.keys()}
 
     model_dict = model.state_dict()
-    
     # 적용 전 일부 파라미터 출력
     sample_key = list(model_dict.keys())[0]
-    print(f"Before LoRA: {sample_key} = {model_dict[sample_key].mean().item()}")
+    print(f"LoRA 적용 전: {sample_key} = {model_dict[sample_key].mean().item()}")
 
-    # Iterate through the LoRA weights and update the model's state dict
-    for key in lora_weights:
-        if key in model_dict:
-            if model_dict[key].shape != lora_weights[key].shape:
-                print(f"Shape mismatch for key {key}. Skipping.")
-                continue
-            # LoRA 가중치에 스케일 적용
-            model_dict[key] = model_dict[key] + lora_scale * lora_weights[key]
-            print(f"Applied LoRA to {key}")
-        else:
-            print(f"Key {key} not found in model. Skipping.")
+    # LoRA 가중치를 순회하며 모델의 state dict 업데이트
+    def map_lora_to_model_key(lora_key):
+        if custom_mappings:
+            for lora_prefix, model_prefix in custom_mappings.items():
+                if lora_key.startswith(lora_prefix):
+                    suffix = lora_key[len(lora_prefix):]
+                    parts = suffix.split('.')
+                    if len(parts) >= 3 and parts[0] == "transformer_blocks":
+                        block_num = int(parts[1])
+                        component = '.'.join(parts[2:])
+                        return f"{model_prefix}transformer_blocks.{block_num}.{component}"
+        return lora_key
 
-    # Load the updated state dict
+    for lora_key in lora_weights:
+        if '.lora.up.' in lora_key:
+            base_key = lora_key.split('.lora.up.')[0]
+            model_key = map_lora_to_model_key(base_key)
+            
+            # .weight를 유지한 키로 모델 딕셔너리에서 검색
+            model_key_with_weight = model_key + '.weight'
+            lora_key_with_weight = lora_key
+            if model_key_with_weight in model_dict:
+                up_weight = lora_weights[lora_key_with_weight]
+                down_weight = lora_weights[f"{base_key}.lora.down.weight"]
+                
+                # LoRA 가중치 계산: up_weight * down_weight
+                lora_weight = torch.matmul(up_weight, down_weight)
+                
+                if model_dict[model_key_with_weight].shape != lora_weight.shape:
+                    print(f"형태 불일치: {lora_key_with_weight} (LoRA) vs {model_key_with_weight} (모델). 건너뜁니다.")
+                    continue
+                
+                # LoRA 가중치에 스케일 적용하고 모델 가중치에 더하기
+                model_dict[model_key_with_weight] = model_dict[model_key_with_weight] + lora_scale * lora_weight
+                print(f"LoRA 적용됨: {lora_key_with_weight} (LoRA) -> {model_key_with_weight} (모델)")
+            else:
+                print(f"키를 찾을 수 없음: {lora_key_with_weight} (LoRA) -> {model_key_with_weight} (모델). 건너뜁니다.")
+
+    # 업데이트된 state dict 로드
     model.load_state_dict(model_dict)
 
     # 적용 후 같은 파라미터 출력
-    print(f"After LoRA: {sample_key} = {model_dict[sample_key].mean().item()}")
+    print(f"LoRA 적용 후: {sample_key} = {model_dict[sample_key].mean().item()}")
 
-    print(f"LoRA weights loaded from {lora_checkpoint_path} and applied to the model.")
+    print(f"LoRA 가중치가 {lora_checkpoint_path}에서 로드되어 모델에 적용되었습니다.")
     return model
+
+# 사용 예시:
+custom_mappings = {
+    "unet.down_blocks.0.attentions.0.": "model.diffusion_model.input_blocks.1.1.",
+    "unet.down_blocks.0.attentions.1.": "model.diffusion_model.input_blocks.2.1.",
+    "unet.down_blocks.1.attentions.0.": "model.diffusion_model.input_blocks.4.1.",
+    "unet.down_blocks.1.attentions.1.": "model.diffusion_model.input_blocks.5.1.",
+    "unet.down_blocks.2.attentions.0.": "model.diffusion_model.input_blocks.7.1.",
+    "unet.down_blocks.2.attentions.1.": "model.diffusion_model.input_blocks.8.1.",
+    
+    "unet.mid_block.attentions.0.": "model.diffusion_model.middle_block.1.",
+    
+    "unet.up_blocks.1.attentions.0.": "model.diffusion_model.output_blocks.3.1.",
+    "unet.up_blocks.1.attentions.1.": "model.diffusion_model.output_blocks.4.1.",
+    "unet.up_blocks.1.attentions.2.": "model.diffusion_model.output_blocks.5.1.",
+    "unet.up_blocks.2.attentions.0.": "model.diffusion_model.output_blocks.6.1.",
+    "unet.up_blocks.2.attentions.1.": "model.diffusion_model.output_blocks.7.1.",
+    "unet.up_blocks.2.attentions.2.": "model.diffusion_model.output_blocks.8.1.",
+    "unet.up_blocks.3.attentions.0.": "model.diffusion_model.output_blocks.9.1.",
+    "unet.up_blocks.3.attentions.1.": "model.diffusion_model.output_blocks.10.1.",
+    "unet.up_blocks.3.attentions.2.": "model.diffusion_model.output_blocks.11.1.",
+    
+    # lora_dict : model_dict
+}
+
 
 def load_lora_weights(model, repo_id, filename="pytorch_lora_weights.safetensors"):
     """
@@ -109,16 +176,29 @@ apply_midas = MidasDetector()
 apply_seg = UniformerDetector()
 apply_content = ContentDetector()
 
-lora_checkpoint_path = "/workspace/mnt/sda/changhyun/ControlNeXt/ControlNeXt-SDXL/lora/singleline/SingleLineArt-LORA.safetensors"
+lora_checkpoint_path = "/workspace/mnt/sda/changhyun/dreambooth_lora/lora/oddoong/total_no_text/t2i/data_preprocess_identifier_1337_cosine_no_crop_4000/checkpoint-2000/pytorch_lora_weights.safetensors"
 repo_id = "lora-library/B-LoRA-cartoon_line"
 
 model = create_model('./configs/uni_v15.yaml').cpu()
 model.load_state_dict(load_state_dict('./ckpt/uni.ckpt', location='cuda'))
+
 model = model.cuda()
 # add LoRA
-#model = apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0)
+model = apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0, custom_mappings=custom_mappings)
 #load_lora_weights(model, repo_id)
 ddim_sampler = DDIMSampler(model)
+
+# Print model modules
+#print_model_modules(model.model)
+# # 모델 구조를 문자열로 캡처
+# model_architecture = str(model.model)
+
+# # architecture.txt 파일에 모델 구조 저장
+# with open('architecture.txt', 'w') as f:
+#     f.write(model_architecture)
+
+# print("모델 구조가 architecture.txt 파일에 저장되었습니다.")
+
 def save_detected_maps(detected_maps_list, save_dir, sample_idx):
     map_names = ["canny", "mlsd", "hed", "sketch", "openpose", "midas", "seg"]
     
@@ -191,7 +271,11 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
             hed_detected_map = np.zeros((H, W, C)).astype(np.uint8)
         if sketch_image is not None:
             sketch_image = cv2.resize(sketch_image, (W, H))
-            sketch_detected_map = HWC3(apply_sketch(HWC3(sketch_image)))            
+            sketch_detected_map = HWC3(apply_sketch(HWC3(sketch_image)))
+            sketch_detected_map = Image.fromarray(sketch_detected_map)
+            sketch_detected_map = sketch_detected_map.filter(ImageFilter.GaussianBlur(radius=5)) 
+            sketch_detected_map.save(os.path.join("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/oddoong/lora/blur_10_sketch_content_identifier_action_paduk", 'blurred_sketch.png'))
+            sketch_detected_map = np.array(sketch_detected_map)           
         else:
             sketch_detected_map = np.zeros((H, W, C)).astype(np.uint8)
         if openpose_image is not None:
@@ -239,9 +323,8 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
         uc_local_control = local_control
         uc_global_control = torch.zeros_like(global_control)
         cond = {"local_control": [local_control], "c_crossattn": [model.get_learned_conditioning([prompt + ', ' + a_prompt] * num_samples)], 'global_control': [global_control]}
-        un_cond = {"local_control": [uc_local_control], "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples)], 'global_control': [uc_global_control]}
+        un_cond = {"local_control": [uc_local_control], "c_crossattn": [model.get_learned_conditioning([n_prompt] * num_samples)], 'global_control': [uc_global_control]} # global, local condition 
         shape = (4, H // 8, W // 8)
-
         if config.save_memory:
             model.low_vram_shift(is_diffusing=True)
 
@@ -249,7 +332,7 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
         samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
                                                      shape, cond, verbose=False, eta=eta,
                                                      unconditional_guidance_scale=scale,
-                                                     unconditional_conditioning=un_cond, global_strength=global_strength)
+                                                     unconditional_conditioning=un_cond, global_strength=global_strength) # global, local condition 추가
 
         if config.save_memory:
             model.low_vram_shift(is_diffusing=False)
@@ -261,65 +344,16 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
     return [results, detected_maps_list]
 
 
-# block = gr.Blocks().queue()
-# with block:
-#     with gr.Row():
-#         gr.Markdown("## Uni-ControlNet Demo")
-#     with gr.Row():
-#         canny_image = gr.Image(source='upload', type="numpy", label='canny')
-#         mlsd_image = gr.Image(source='upload', type="numpy", label='mlsd')
-#         hed_image = gr.Image(source='upload', type="numpy", label='hed')
-#         sketch_image = gr.Image(source='upload', type="numpy", label='sketch')
-#     with gr.Row():
-#         openpose_image = gr.Image(source='upload', type="numpy", label='openpose')
-#         midas_image = gr.Image(source='upload', type="numpy", label='midas')
-#         seg_image = gr.Image(source='upload', type="numpy", label='seg')
-#         content_image = gr.Image(source='upload', type="numpy", label='content')
-#     with gr.Row():
-#         prompt = gr.Textbox(label="Prompt")
-#     with gr.Row():
-#         run_button = gr.Button(label="Run")
-#     with gr.Row():
-#         with gr.Column():
-#             with gr.Accordion("Advanced options", open=False):
-#                 num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=4, step=1)
-#                 image_resolution = gr.Slider(label="Image Resolution", minimum=256, maximum=768, value=512, step=64)
-#                 strength = gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1, step=0.01)
-
-#                 global_strength = gr.Slider(label="Global Strength", minimum=0, maximum=2, value=1, step=0.01)
-                
-#                 low_threshold = gr.Slider(label="Canny Low Threshold", minimum=1, maximum=255, value=100, step=1)
-#                 high_threshold = gr.Slider(label="Canny High Threshold", minimum=1, maximum=255, value=200, step=1)
-
-#                 value_threshold = gr.Slider(label="Hough Value Threshold (MLSD)", minimum=0.01, maximum=2.0, value=0.1, step=0.01)
-#                 distance_threshold = gr.Slider(label="Hough Distance Threshold (MLSD)", minimum=0.01, maximum=20.0, value=0.1, step=0.01)
-#                 alpha = gr.Slider(label="Alpha", minimum=0.1, maximum=20.0, value=6.2, step=0.01)
-                
-#                 ddim_steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=50, step=1)
-#                 scale = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=30.0, value=7.5, step=0.1)
-#                 seed = gr.Slider(label="Seed", minimum=-1, maximum=2147483647,  value=42, step=1)
-#                 eta = gr.Number(label="Eta (DDIM)", value=0.0)
-                
-#                 a_prompt = gr.Textbox(label="Added Prompt", value='best quality, extremely detailed')
-#                 n_prompt = gr.Textbox(label="Negative Prompt",
-#                                       value='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality')
-        
-#     with gr.Row():
-#         image_gallery = gr.Gallery(label='Output', show_label=False, elem_id="gallery").style(grid=4, height='auto')
-#     with gr.Row():
-#         cond_gallery = gr.Gallery(label='Output', show_label=False, elem_id="gallery").style(grid=4, height='auto')
-
-
-canny_image = None#np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/pokemon/canny.jpg").convert('RGB'))
-mlsd_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
+canny_image = None #np.array(Image.open("./data/oddoong/paduk.jpg").convert('RGB'))
+mlsd_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/oddoong/fence.jpg").convert('RGB'))
 hed_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
-sketch_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/pokemon/canny.jpg").convert('RGB'))
+sketch_image = np.array(Image.open("./data/oddoong/paduk.jpg").convert('RGB'))
 openpose_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
-midas_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
-seg_image = np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/pokemon/canny.jpg").convert('RGB'))
-content_image = np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/pokemon/content.jpg").convert('RGB'))
-
-prompt = "A cheerful, yellow, mouse-like character with pointy ears, red cheeks, and a lightning bolt-shaped tail."
+midas_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/samples/multi_conditions/case1/midas.jpg").convert('RGB'))
+seg_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/simpson/homer.png").convert('RGB'))
+content_image = np.array(Image.open("./data/oddoong/oddoong.jpg").convert('RGB'))
+#np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/case1/reproduce_sketch.png").convert('RGB'))
+prompt = "a [v] duck with yellow beak laughing"
 a_prompt = "best quality, extremely detailed"
 n_prompt = "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
 num_samples = 5
@@ -327,7 +361,7 @@ image_resolution = 512
 ddim_steps = 50
 strength = 1
 scale = 7.5
-seed = 36
+seed = 48
 eta = 0.0
 low_threshold = 100
 high_threshold = 200
@@ -335,21 +369,25 @@ value_threshold = 0.1
 distance_threshold = 0.1
 alpha = 6.2
 global_strength = 1
-    
-save_dir = "/workspace/mnt/sda/changhyun/Uni-ControlNet/data/pokemon/36_text_content_seg"
 
-ips = [canny_image, mlsd_image, hed_image, sketch_image, openpose_image, midas_image, seg_image, content_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, strength, scale, seed, eta, low_threshold, high_threshold, value_threshold, distance_threshold, alpha, global_strength]
-outputs, maps = process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, midas_image, seg_image, content_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, strength, scale, seed, eta, low_threshold, high_threshold, value_threshold, distance_threshold, alpha, global_strength )
-
-# for sample_idx, detected_maps in enumerate(maps):
-#     save_detected_maps(detected_maps, save_dir, sample_idx)
+save_dir = "/workspace/mnt/sda/changhyun/Uni-ControlNet/data/oddoong/lora/blur_5_sketch_content_identifier_paduk"
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
 
+
+ips = [canny_image, mlsd_image, hed_image, sketch_image, openpose_image, midas_image, seg_image, content_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, strength, scale, seed, eta, low_threshold, high_threshold, value_threshold, distance_threshold, alpha, global_strength]
+
+
+
+
+outputs, maps = process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, midas_image, seg_image, content_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, ddim_steps, strength, scale, seed, eta, low_threshold, high_threshold, value_threshold, distance_threshold, alpha, global_strength )
+
+
+temp_sketch = Image.fromarray(np.array(maps[3]))  # numpy.ndarray를 PIL 이미지로 변환
+temp_sketch.save(os.path.join(save_dir, 'blurred_sketch.png'))
+
 # 주어진 리스트를 NumPy 배열로 변환
 image_array = np.array(outputs)
-
-
 
 # 이미지를 순차적으로 저장
 for i in range(5):
