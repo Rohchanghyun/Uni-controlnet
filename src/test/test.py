@@ -183,9 +183,11 @@ model = create_model('./configs/uni_v15.yaml').cpu()
 model.load_state_dict(load_state_dict('./ckpt/uni.ckpt', location='cuda'))
 
 model = model.cuda()
+
 # add LoRA
-model = apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0, custom_mappings=custom_mappings)
+#model = apply_lora_weights(model, lora_checkpoint_path, lora_scale=1.0, custom_mappings=custom_mappings)
 #load_lora_weights(model, repo_id)
+
 ddim_sampler = DDIMSampler(model)
 
 # Print model modules
@@ -274,7 +276,7 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
             sketch_detected_map = HWC3(apply_sketch(HWC3(sketch_image)))
             sketch_detected_map = Image.fromarray(sketch_detected_map)
             sketch_detected_map = sketch_detected_map.filter(ImageFilter.GaussianBlur(radius=5)) 
-            sketch_detected_map.save(os.path.join("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/oddoong/lora/blur_10_sketch_content_identifier_action_paduk", 'blurred_sketch.png'))
+            sketch_detected_map.save(os.path.join("/workspace/projects/emoji_generation/Uni-controlnet/data/oddoong/lora/blur_10_sketch_content_identifier_action_paduk", 'blurred_sketch.png'))
             sketch_detected_map = np.array(sketch_detected_map)           
         else:
             sketch_detected_map = np.zeros((H, W, C)).astype(np.uint8)
@@ -344,16 +346,17 @@ def process(canny_image, mlsd_image, hed_image, sketch_image, openpose_image, mi
     return [results, detected_maps_list]
 
 
-canny_image = None #np.array(Image.open("./data/oddoong/paduk.jpg").convert('RGB'))
-mlsd_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/oddoong/fence.jpg").convert('RGB'))
-hed_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
-sketch_image = np.array(Image.open("./data/oddoong/paduk.jpg").convert('RGB'))
-openpose_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/data/condition.jpg").convert('RGB'))
-midas_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-ControlNet/samples/multi_conditions/case1/midas.jpg").convert('RGB'))
-seg_image = None #np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/simpson/homer.png").convert('RGB'))
-content_image = np.array(Image.open("./data/oddoong/oddoong.jpg").convert('RGB'))
-#np.array(Image.open("/workspace/mnt/sda/changhyun/Uni-controlnet/data/case1/reproduce_sketch.png").convert('RGB'))
-prompt = "a [v] duck with yellow beak laughing"
+canny_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+mlsd_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+hed_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+sketch_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/sketch.png").convert('RGB'))
+openpose_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+midas_image = None #np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+seg_image = np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+content_image = np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/sketch.png").convert('RGB'))
+#np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/sketch.png").convert('RGB'))
+#np.array(Image.open("/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/condition.png").convert('RGB'))
+prompt = "a white duck with yellow beak laughing"
 a_prompt = "best quality, extremely detailed"
 n_prompt = "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
 num_samples = 5
@@ -361,7 +364,7 @@ image_resolution = 512
 ddim_steps = 50
 strength = 1
 scale = 7.5
-seed = 48
+seed = 733
 eta = 0.0
 low_threshold = 100
 high_threshold = 200
@@ -370,7 +373,7 @@ distance_threshold = 0.1
 alpha = 6.2
 global_strength = 1
 
-save_dir = "/workspace/mnt/sda/changhyun/Uni-ControlNet/data/oddoong/lora/blur_5_sketch_content_identifier_paduk"
+save_dir = "/workspace/projects/emoji_generation/Uni-controlnet/samples/condition_test/seg"
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
 
@@ -398,4 +401,4 @@ for i in range(5):
     img_pil = Image.fromarray(np.uint8(img.transpose(2, 1, 0)))  # 다시 (512, 640, 3)로 변환
     
     # 파일 경로 생성 및 저장 (이미지 번호로 이름 생성)
-    img_pil.save(os.path.join(save_dir, f'image_{i+1}.png'))
+    img_pil.save(os.path.join(save_dir, f'image_canny_{i+6}.png'))
